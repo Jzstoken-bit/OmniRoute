@@ -1,4 +1,7 @@
 import { NextResponse } from "next/server";
+import { FalClient } from "@omniroute/open-sse/handlers/fal/client";
+import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch";
+import { isFalNativeEnabled } from "@/shared/utils/featureFlags";
 import {
   getProviderConnectionFamilyIds,
   isClaudeCodeCompatibleProvider,
@@ -138,6 +141,7 @@ import {
   normalizeSapModelsResponse,
   normalizeAzureModelsResponse,
 } from "./discovery/normalizers";
+import { usesConnectionScopedSyncedCatalog } from "./connectionScopedCatalog";
 import { isNamedOpenAIStyleProvider } from "./discovery/providerSets";
 import { buildStaleEncryptionKeyResponse } from "./staleEncryptionGuard";
 import {
@@ -162,6 +166,7 @@ import { applyConnectionCustomHeaders } from "./discovery/connectionCustomHeader
 import { maybeHandleConolOrSyntxModelDiscovery } from "./webSessionDiscovery";
 import { maybeHandleTwinmindModelDiscovery } from "./twinmindDiscovery";
 import { maybeHandleDevinDesktopModelDiscovery } from "./devinDesktopDiscovery";
+import { maybeHandleMuseCodeModelDiscovery } from "./museCodeDiscovery";
 import { maybeHandleVertexModelDiscovery } from "./vertexDiscovery";
 import { buildNoAuthModelsResponse, filterModelsForRoute } from "./modelRouteProjection";
 
@@ -298,6 +303,40 @@ export async function GET(
     const connectionId = typeof connection.id === "string" ? connection.id : id;
     const apiKey = typeof connection.apiKey === "string" ? connection.apiKey : "";
     const accessToken = typeof connection.accessToken === "string" ? connection.accessToken : "";
+    if (provider === "fal-ai" && isFalNativeEnabled()) {
+      const falProxy = await resolveProxyForConnection(connectionId, undefined, "fal-ai");
+      const client = new FalClient(apiKey || accessToken, (url, init) =>
+        runWithProxyContext(falProxy.proxy, () => fetch(url, init))
+      );
+      const query = new URLSearchParams();
+      for (const field of ["q", "category", "cursor", "limit"]) {
+        const value = searchParams.get(field);
+        if (value !== null) query.set(field, value);
+      }
+      const page = await client.discover(query, request.signal);
+      const models = (
+        page.models as Array<{
+          endpoint_id: string;
+          metadata?: { display_name?: string; category?: string };
+        }>
+      ).map((model) => ({
+        id: model.endpoint_id,
+        name: model.metadata?.display_name || model.endpoint_id,
+        category: model.metadata?.category ?? null,
+        execution_path: "/v1/fal/run",
+        verification: "discovered",
+        capabilitySource: "fal-catalog",
+      }));
+      // Do not label a catalog-only entry as chat-compatible or schema-validated.
+      return buildResponse({
+        provider,
+        connectionId,
+        models,
+        source: "api",
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+      });
+    }
     const codexDiscoveryMode =
       provider === "codex" ? getCodexDiscoveryMode(connection.providerSpecificData) : "off";
     const autoFetchModels =
@@ -312,12 +351,16 @@ export async function GET(
           chatOnly
         );
 
-    // Check for synced models from ANY connection of this provider.
-    // When sync has been performed (even on a different connection),
-    // use the synced list as the authoritative source instead of static models.
+    // Synced rows from any connection of this provider replace the static
+    // catalog. Key-scoped gateways stay on this connection's own cache:
+    // `cachedDiscoveryModels` above is already connection-scoped, and borrowing
+    // a sibling key would show models this key cannot call.
     let providerSyncedModels: ReturnType<typeof toDiscoveryCatalogModel>[] | null = null;
     try {
-      const allSynced = usesCuratedModelsOnly ? [] : await getSyncedAvailableModels(provider);
+      const allSynced =
+        usesCuratedModelsOnly || usesConnectionScopedSyncedCatalog(provider)
+          ? []
+          : await getSyncedAvailableModels(provider);
       const selectableSynced = filterModelsForRoute(provider, allSynced, chatOnly);
       if (selectableSynced.length > 0) {
         providerSyncedModels = selectableSynced.map((model) => toDiscoveryCatalogModel(model));
@@ -701,6 +744,9 @@ export async function GET(
 
     const devinDesktopResponse = await maybeHandleDevinDesktopModelDiscovery(webDiscoveryArgs);
     if (devinDesktopResponse) return devinDesktopResponse;
+
+    const museCodeResponse = await maybeHandleMuseCodeModelDiscovery(webDiscoveryArgs);
+    if (museCodeResponse) return museCodeResponse;
 
     if (provider === "bedrock") {
       const cachedResponse = maybeReturnCachedDiscovery();
